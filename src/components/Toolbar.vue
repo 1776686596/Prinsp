@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import type { ToolType } from '../types'
 
-const props = defineProps<{
+defineProps<{
   currentTool: ToolType
   currentColor: string
   canUndo: boolean

@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import { listen } from '@tauri-apps/api/event'
 import { invoke } from '@tauri-apps/api/core'
+import { save } from '@tauri-apps/plugin-dialog'
 import { useScreenshot } from './composables/useScreenshot'
 import { useAnnotation } from './composables/useAnnotation'
 import RegionSelector from './components/RegionSelector.vue'
@@ -11,6 +12,13 @@ import Settings from './components/Settings.vue'
 import type { Selection } from './types'
 
 type Mode = 'idle' | 'selecting' | 'editing'
+
+const TOOLBAR_WIDTH = 580
+const TOOLBAR_HEIGHT = 48
+const TOOLBAR_GAP = 10
+const OCR_WIDTH = 400
+const OCR_HEIGHT = 200
+const OCR_GAP = 10
 
 const mode = ref<Mode>('idle')
 const selection = ref<Selection>({ x: 0, y: 0, width: 0, height: 0 })
@@ -23,6 +31,67 @@ const ocrLoading = ref(false)
 
 const { screenshotData, copyToClipboard } = useScreenshot()
 const { annotations, currentTool, currentColor, currentLineWidth, addAnnotation, undo, redo, clear, canUndo, canRedo } = useAnnotation()
+
+const toolbarPosition = computed(() => {
+  const screenW = window.innerWidth
+  const screenH = window.innerHeight
+  const sel = selection.value
+  const bottomSpace = screenH - (sel.y + sel.height)
+  const topSpace = sel.y
+
+  let top: number
+  if (bottomSpace >= TOOLBAR_HEIGHT + TOOLBAR_GAP) {
+    top = sel.y + sel.height + TOOLBAR_GAP
+  } else if (topSpace >= TOOLBAR_HEIGHT + TOOLBAR_GAP) {
+    top = sel.y - TOOLBAR_HEIGHT - TOOLBAR_GAP
+  } else {
+    top = Math.max(0, Math.min(sel.y + sel.height + TOOLBAR_GAP, screenH - TOOLBAR_HEIGHT))
+  }
+
+  const margin = 8
+
+  // 判断选区是否靠近右边缘（右侧空间不足放下工具栏）
+  if (screenW - sel.x < TOOLBAR_WIDTH + margin) {
+    // 使用 right 定位，贴着屏幕右边缘
+    return { right: `${margin}px`, left: 'auto', top: `${top}px` }
+  }
+
+  // 正常情况，左对齐到选区
+  let left = sel.x
+  if (left < margin) left = margin
+
+  return { left: `${left}px`, right: 'auto', top: `${top}px` }
+})
+
+const ocrPosition = computed(() => {
+  const screenW = window.innerWidth
+  const screenH = window.innerHeight
+  const sel = selection.value
+  const toolbarTop = parseFloat(toolbarPosition.value.top)
+  const isToolbarBelow = toolbarTop > sel.y
+
+  let top: number
+  if (isToolbarBelow) {
+    top = toolbarTop + TOOLBAR_HEIGHT + OCR_GAP
+  } else {
+    top = sel.y + sel.height + TOOLBAR_GAP
+  }
+  if (top + OCR_HEIGHT > screenH) {
+    top = Math.max(0, screenH - OCR_HEIGHT)
+  }
+
+  const margin = 8
+
+  // 与工具栏相同的左右定位逻辑
+  if (screenW - sel.x < OCR_WIDTH + margin) {
+    return { right: `${margin}px`, left: 'auto', top: `${top}px` }
+  }
+
+  let left = sel.x
+  if (left < margin) left = margin
+
+  return { left: `${left}px`, right: 'auto', top: `${top}px` }
+})
 
 async function startCapture() {
   // 隐藏窗口并截屏
@@ -68,17 +137,17 @@ async function confirm() {
   canvas.width = selection.value.width
   canvas.height = selection.value.height
   const ctx = canvas.getContext('2d')!
-  
+
   const img = new Image()
   img.src = 'data:image/png;base64,' + croppedImage.value
   await new Promise(r => img.onload = r)
   ctx.drawImage(img, 0, 0)
-  
+
   annotations.value.forEach(a => {
     ctx.strokeStyle = a.style.color
     ctx.fillStyle = a.style.color
     ctx.lineWidth = a.style.lineWidth
-    
+
     if (a.type === 'rect' && a.points.length >= 2) {
       const [p1, p2] = a.points
       ctx.strokeRect(p1.x, p1.y, p2.x - p1.x, p2.y - p1.y)
@@ -115,15 +184,31 @@ async function confirm() {
       }
     }
   })
-  
+
   const finalData = canvas.toDataURL('image/png').split(',')[1]
   await copyToClipboard(finalData)
+
+  const savePath = await save({
+    defaultPath: `screenshot_${Date.now()}.png`,
+    filters: [{ name: 'PNG', extensions: ['png'] }]
+  })
+
+  if (savePath) {
+    try {
+      await invoke('save_image_to_file', { base64Data: finalData, path: savePath })
+    } catch (e) {
+      console.error('Save error:', e)
+    }
+  }
+
   reset()
+  await invoke('hide_window')
 }
 
 async function cancel() {
   await invoke('restore_window')
   reset()
+  await invoke('hide_window')
 }
 
 async function performOcr() {
@@ -162,6 +247,17 @@ onMounted(async () => {
 
   await listen('start-capture', () => {
     startCapture()
+  })
+
+  await listen('open-settings', () => {
+    showSettings.value = true
+  })
+
+  // ESC 键取消截图
+  window.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && (mode.value === 'selecting' || mode.value === 'editing')) {
+      cancel()
+    }
   })
 })
 
@@ -219,7 +315,7 @@ async function applyGlobalShortcut() {
           @add-annotation="addAnnotation"
         />
       </div>
-      <div class="toolbar-container" :style="{ left: selection.x + 'px', top: selection.y + selection.height + 10 + 'px' }">
+      <div class="toolbar-container" :style="toolbarPosition">
         <Toolbar
           :current-tool="currentTool"
           :current-color="currentColor"
@@ -234,10 +330,10 @@ async function applyGlobalShortcut() {
           @ocr="performOcr"
         />
       </div>
-      <div v-if="ocrLoading" class="ocr-result" :style="{ left: selection.x + 'px', top: selection.y + selection.height + 60 + 'px' }">
+      <div v-if="ocrLoading" class="ocr-result" :style="ocrPosition">
         <span>识别中...</span>
       </div>
-      <div v-else-if="showOcrResult" class="ocr-result" :style="{ left: selection.x + 'px', top: selection.y + selection.height + 60 + 'px' }">
+      <div v-else-if="showOcrResult" class="ocr-result" :style="ocrPosition">
         <div class="ocr-header">
           <span>识别结果</span>
           <button @click="showOcrResult = false">✕</button>
@@ -341,6 +437,7 @@ body {
 
 .toolbar-container {
   position: absolute;
+  max-width: calc(100vw - 16px);
 }
 
 .ocr-result {

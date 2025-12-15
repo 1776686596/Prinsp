@@ -1,5 +1,5 @@
 import { ref, computed } from 'vue'
-import type { Annotation, ToolType, Point } from '../types'
+import type { Annotation, ToolType } from '../types'
 
 export function useAnnotation() {
   const annotations = ref<Annotation[]>([])

@@ -4,7 +4,8 @@
       "mcp__codex__codex",
       "mcp__context7__resolve-library-id",
       "mcp__context7__get-library-docs",
-      "WebSearch"
+      "WebSearch",
+      "mcp__gemini__gemini"
     ]
   }
 }

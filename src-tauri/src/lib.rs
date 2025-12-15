@@ -1,13 +1,14 @@
 use arboard::Clipboard;
 use base64::{engine::general_purpose::STANDARD, Engine};
-use image::{GrayImage, ImageFormat, Pixel, RgbImage};
+use image::codecs::png::{CompressionType, FilterType, PngEncoder};
+use image::{imageops::invert, GrayImage, ImageEncoder, Pixel, RgbImage};
 use imageproc::contrast::{otsu_level, threshold};
 use imageproc::distance_transform::Norm;
 use imageproc::filter::median_filter;
 use imageproc::morphology::close;
 use rusty_tesseract::{Args, Image as TessImage};
 use std::collections::HashMap;
-use std::io::Cursor;
+use std::path::Path;
 use std::process::Command;
 use std::sync::{mpsc, Mutex, OnceLock};
 use std::thread;
@@ -95,9 +96,10 @@ fn register_global_shortcut(app: AppHandle, shortcut: String) -> Result<(), Stri
     let normalized = normalize_shortcut(&shortcut);
     let shortcut_label = normalized.clone();
     manager
-        .on_shortcut(normalized.as_str(), move |handle, _shortcut, _event| {
-            // 全局快捷键触发后通知前端开始截图
-            let _ = handle.emit("start-capture", ());
+        .on_shortcut(normalized.as_str(), move |handle, _shortcut, event| {
+            if event.state == ShortcutState::Pressed {
+                let _ = handle.emit("start-capture", ());
+            }
         })
         .map_err(|e| format!("register {shortcut_label}: {e}"))?;
 
@@ -132,11 +134,10 @@ fn restore_window(window: WebviewWindow) -> Result<(), String> {
 fn capture_screen_hidden(window: WebviewWindow) -> Result<String, String> {
     // 隐藏窗口
     window.hide().map_err(|e| e.to_string())?;
-    // 等待窗口完全隐藏
-    thread::sleep(Duration::from_millis(200));
+    // 等待窗口完全隐藏（减少等待时间）
+    thread::sleep(Duration::from_millis(80));
     // 截图
-    let result = capture_screen();
-    result
+    capture_screen()
 }
 
 #[tauri::command]
@@ -156,8 +157,9 @@ fn capture_screen() -> Result<String, String> {
 
     for backend in order {
         let result = match backend {
-            CaptureBackend::Grim => capture_with_timeout("grim", Duration::from_secs(2), capture_with_grim),
-            CaptureBackend::Xcap => capture_with_timeout("xcap", Duration::from_secs(2), capture_with_xcap),
+            // grim 超时缩短到 500ms，快速失败
+            CaptureBackend::Grim => capture_with_timeout("grim", Duration::from_millis(500), capture_with_grim),
+            CaptureBackend::Xcap => capture_with_timeout("xcap", Duration::from_millis(1500), capture_with_xcap),
             CaptureBackend::GnomeScreenshot => capture_with_gnome_screenshot(),
         };
 
@@ -193,11 +195,18 @@ fn capture_with_xcap() -> Result<String, String> {
     let monitor = monitors.into_iter().next().ok_or("No monitor found")?;
     let image = monitor.capture_image().map_err(|e| e.to_string())?;
 
-    let mut buf = Cursor::new(Vec::new());
-    image
-        .write_to(&mut buf, ImageFormat::Png)
+    // 使用快速 PNG 压缩
+    let mut buf = Vec::new();
+    let encoder = PngEncoder::new_with_quality(&mut buf, CompressionType::Fast, FilterType::Sub);
+    encoder
+        .write_image(
+            image.as_raw(),
+            image.width(),
+            image.height(),
+            image::ExtendedColorType::Rgba8,
+        )
         .map_err(|e| e.to_string())?;
-    Ok(STANDARD.encode(buf.into_inner()))
+    Ok(STANDARD.encode(&buf))
 }
 
 fn capture_with_grim() -> Result<String, String> {
@@ -223,8 +232,8 @@ fn capture_with_gnome_screenshot() -> Result<String, String> {
         .spawn()
         .map_err(|e| format!("gnome-screenshot: {}", e))?;
 
-    // 等待最多2秒
-    for _ in 0..20 {
+    // 等待最多 1.5 秒
+    for _ in 0..15 {
         match child.try_wait() {
             Ok(Some(status)) => {
                 if !status.success() {
@@ -312,7 +321,16 @@ fn channel_emphasized_gray(img: &RgbImage) -> GrayImage {
     out
 }
 
-/// 图像预处理：颜色增强→放大→去噪→自适应二值化→闭运算
+/// 根据二值化后的像素占比判断是否为暗底亮字
+fn is_dark_background(binary: &GrayImage) -> bool {
+    let (mut dark, mut light) = (0usize, 0usize);
+    for p in binary.pixels() {
+        if p[0] < 128 { dark += 1; } else { light += 1; }
+    }
+    dark > light
+}
+
+/// 图像预处理：颜色增强→放大→去噪→自适应二值化→闭运算→暗底反转
 fn preprocess_for_ocr(dyn_img: &image::DynamicImage) -> GrayImage {
     let rgb = dyn_img.to_rgb8();
     let (w, h) = rgb.dimensions();
@@ -331,7 +349,14 @@ fn preprocess_for_ocr(dyn_img: &image::DynamicImage) -> GrayImage {
     let binary = threshold(&denoised, thr, imageproc::contrast::ThresholdType::Binary);
 
     // 闭运算填补细笔画断裂
-    close(&binary, Norm::L1, 1)
+    let mut closed = close(&binary, Norm::L1, 1);
+
+    // 若为暗底亮字则反转，使之变为白底黑字
+    if is_dark_background(&closed) {
+        invert(&mut closed);
+    }
+
+    closed
 }
 
 /// 后处理：规范空白，保留段落结构
@@ -441,16 +466,32 @@ fn copy_to_clipboard(base64_data: String) -> Result<(), String> {
     Ok(())
 }
 
+#[tauri::command]
+fn save_image_to_file(base64_data: String, path: String) -> Result<(), String> {
+    let data = STANDARD.decode(&base64_data).map_err(|e| e.to_string())?;
+    let img = image::load_from_memory(&data).map_err(|e| e.to_string())?;
+    let save_path = Path::new(&path);
+    img.save(save_path).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Wayland 环境下强制使用 X11 后端，以支持全局快捷键（XWayland）
+    if std::env::var("WAYLAND_DISPLAY").is_ok() && std::env::var("GDK_BACKEND").is_err() {
+        unsafe { std::env::set_var("GDK_BACKEND", "x11") };
+    }
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             capture_screen,
             capture_screen_hidden,
             register_global_shortcut,
             copy_to_clipboard,
             copy_text_to_clipboard,
+            save_image_to_file,
             hide_window,
             show_window_fullscreen,
             restore_window,
@@ -479,14 +520,14 @@ pub fn run() {
             }
 
             let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
-            let capture =
-                MenuItem::with_id(app, "capture", "截图 (Ctrl+Shift+A)", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&capture, &quit])?;
+            let settings = MenuItem::with_id(app, "settings", "设置", true, None::<&str>)?;
+            let capture = MenuItem::with_id(app, "capture", "截图", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&capture, &settings, &quit])?;
 
             let _tray = TrayIconBuilder::new()
                 .icon(app.default_window_icon().unwrap().clone())
                 .menu(&menu)
-                .show_menu_on_left_click(false)
+                .show_menu_on_left_click(true)
                 .tooltip("PrinSp 截图工具")
                 .on_tray_icon_event(|tray, event| match event {
                     TrayIconEvent::Click {
@@ -495,8 +536,6 @@ pub fn run() {
                         ..
                     } => {
                         if let Some(window) = tray.app_handle().get_webview_window("main") {
-                            let _ = window.show();
-                            let _ = window.set_focus();
                             let _ = window.emit("start-capture", ());
                         }
                     }
@@ -506,20 +545,21 @@ pub fn run() {
                     "quit" => {
                         app.exit(0);
                     }
-                    "capture" => {
+                    "settings" => {
                         if let Some(window) = app.get_webview_window("main") {
                             let _ = window.show();
                             let _ = window.set_focus();
+                            let _ = window.emit("open-settings", ());
+                        }
+                    }
+                    "capture" => {
+                        if let Some(window) = app.get_webview_window("main") {
                             let _ = window.emit("start-capture", ());
                         }
                     }
                     _ => {}
                 })
                 .build(app)?;
-
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.emit("start-capture", ());
-            }
 
             Ok(())
         })
